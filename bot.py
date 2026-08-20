@@ -1,426 +1,767 @@
+--- bot.py (原始)
 import os
-import sys
 import logging
 import asyncio
 import re
+from pyrogram import Client, filters
+from pyrogram.types import Message
+from pyrogram.enums import ParseMode
+from PIL import Image
+import io
+import aiohttp
+from dotenv import load_dotenv
+
+# بارگذاری متغیرهای محیطی
+load_dotenv()
+
+# تنظیمات لاگینگ
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# متغیرهای محیطی از Railway
+API_ID = os.getenv('API_ID')
+API_HASH = os.getenv('API_HASH')
+BOT_TOKEN = os.getenv('BOT_TOKEN')
+SOURCE_CHANNEL_ID = os.getenv('SOURCE_CHANNEL_ID')  # آیدی کانال مبدا (مثلا -1001234567890)
+DEST_CHANNEL_ID = os.getenv('DEST_CHANNEL_ID')      # آیدی کانال مقصد
+ADMIN_USER_IDS = os.getenv('ADMIN_USER_IDS', '').split(',')  # آیدی ادمین‌هایی که می‌توانند تنظیمات را تغییر دهند
+
+# تامنیل پیش‌فرض (اختیاری)
+DEFAULT_THUMBNAIL_URL = os.getenv('DEFAULT_THUMBNAIL_URL', None)
+
+# صف برای پردازش پیام‌ها
+message_queue = asyncio.Queue()
+is_processing = False
+
+# دیکشنری برای ذخیره کلمات جایگزین
+replacement_words = {}
+
+# کلاینت‌ها
+app = None  # User Client
+bot = None  # Bot Client
+
+async def download_thumbnail(url: str) -> bytes:
+    """دانلود تامنیل از URL"""
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as response:
+            return await response.read()
+
+async def create_custom_thumbnail(image_data: bytes, text: str = None) -> bytes:
+    """ساخت تامنیل سفارشی با PIL"""
+    try:
+        img = Image.open(io.BytesIO(image_data))
+        img = img.convert('RGB')
+        img = img.resize((1280, 720))  # سایز استاندارد
+
+        output = io.BytesIO()
+        img.save(output, format='JPEG', quality=85)
+        return output.getvalue()
+    except Exception as e:
+        logger.error(f"Error creating thumbnail: {e}")
+        return image_data
+
+def replace_text_in_message(text: str) -> str:
+    """جایگزینی کلمات در متن پیام"""
+    if not text:
+        return text
+
+    result = text
+    for old_word, new_word in replacement_words.items():
+        result = result.replace(old_word, new_word)
+
+    return result
+
+def strip_premium_emojis(text: str) -> str:
+    """حذف ایموجی‌های پرمیوم و تبدیل به نسخه عادی"""
+    if not text:
+        return text
+
+    # حذف کاراکترهای خاص ایموجی‌های پرمیوم تلگرام
+    # ایموجی‌های پرمیوم معمولاً در محدوده‌های خاصی از یونیکد قرار دارند
+    premium_ranges = [
+        (0x1F4A9, 0x1F4A9),  # مثال: برخی ایموجی‌های خاص
+        # می‌توانید محدوده‌های بیشتری اضافه کنید
+    ]
+
+    result = []
+    for char in text:
+        code_point = ord(char)
+        is_premium = False
+        for start, end in premium_ranges:
+            if start <= code_point <= end:
+                is_premium = True
+                break
+        if not is_premium:
+            result.append(char)
+
+    return ''.join(result)
+
+async def process_message(message):
+    """پردازش یک پیام از کانال مبدا و کپی به کانال مقصد"""
+    global is_processing
+    try:
+        # دریافت محتوای پیام
+        caption = message.caption if message.caption else ""
+
+        # جایگزینی کلمات
+        caption = replace_text_in_message(caption)
+
+        # حذف ایموجی‌های پرمیوم
+        caption = strip_premium_emojis(caption)
+
+        # بررسی نوع محتوا و کپی به کانال مقصد
+        if message.photo:
+            # دریافت عکس
+            photo = message.photo[-1]  # بهترین کیفیت
+
+            # دانلود عکس
+            photo_path = await app.download_media(photo.file_id)
+
+            # اگر تامنیل سفارشی داریم
+            thumb_path = None
+            if DEFAULT_THUMBNAIL_URL:
+                thumb_data = await download_thumbnail(DEFAULT_THUMBNAIL_URL)
+                thumb_io = io.BytesIO(thumb_data)
+                thumb_io.name = "thumbnail.jpg"
+                thumb_path = thumb_io
+
+            # ارسال به کانال مقصد بدون فوروارد
+            await bot.send_photo(
+                chat_id=DEST_CHANNEL_ID,
+                photo=photo_path,
+                caption=caption,
+                parse_mode=ParseMode.HTML,
+                thumb=thumb_path
+            )
+
+            # پاک کردن فایل موقت
+            if os.path.exists(photo_path):
+                os.remove(photo_path)
+
+        elif message.video:
+            # دریافت ویدیو
+            video_path = await app.download_media(message.video.file_id)
+
+            # دانلود تامنیل اگر وجود دارد
+            thumb_path = None
+            if message.video.thumbs:
+                thumb_data = await app.download_media(message.video.thumbs[0].file_id)
+
+                # اگر تامنیل سفارشی داریم
+                if DEFAULT_THUMBNAIL_URL:
+                    custom_thumb = await download_thumbnail(DEFAULT_THUMBNAIL_URL)
+                    thumb_io = io.BytesIO(custom_thumb)
+                    thumb_io.name = "thumbnail.jpg"
+                    thumb_path = thumb_io
+                else:
+                    thumb_path = thumb_data
+
+            # ارسال ویدیو با تامنیل سفارشی
+            await bot.send_video(
+                chat_id=DEST_CHANNEL_ID,
+                video=video_path,
+                caption=caption,
+                parse_mode=ParseMode.HTML,
+                thumb=thumb_path
+            )
+
+            # پاک کردن فایل موقت
+            if os.path.exists(video_path):
+                os.remove(video_path)
+
+        elif message.document:
+            # دریافت فایل
+            file_path = await app.download_media(message.document.file_id)
+
+            # ارسال فایل
+            await bot.send_document(
+                chat_id=DEST_CHANNEL_ID,
+                document=file_path,
+                caption=caption,
+                parse_mode=ParseMode.HTML
+            )
+
+            # پاک کردن فایل موقت
+            if os.path.exists(file_path):
+                os.remove(file_path)
+
+        elif message.audio:
+            # دریافت صوت
+            audio_path = await app.download_media(message.audio.file_id)
+
+            # دانلود تامنیل اگر وجود دارد
+            thumb_path = None
+            if message.audio.thumbs:
+                thumb_path = await app.download_media(message.audio.thumbs[0].file_id)
+
+            # ارسال صوت
+            await bot.send_audio(
+                chat_id=DEST_CHANNEL_ID,
+                audio=audio_path,
+                caption=caption,
+                parse_mode=ParseMode.HTML,
+                thumb=thumb_path,
+                performer=message.audio.performer,
+                title=message.audio.title
+            )
+
+            # پاک کردن فایل موقت
+            if os.path.exists(audio_path):
+                os.remove(audio_path)
+
+        elif message.voice:
+            # دریافت ویس
+            voice_path = await app.download_media(message.voice.file_id)
+
+            # ارسال ویس
+            await bot.send_voice(
+                chat_id=DEST_CHANNEL_ID,
+                voice=voice_path,
+                caption=caption,
+                parse_mode=ParseMode.HTML
+            )
+
+            # پاک کردن فایل موقت
+            if os.path.exists(voice_path):
+                os.remove(voice_path)
+
+        elif message.text:
+            # ارسال متن ساده
+            await bot.send_message(
+                chat_id=DEST_CHANNEL_ID,
+                text=caption,
+                parse_mode=ParseMode.HTML
+            )
+
+        else:
+            logger.info(f"Unsupported message type: {message}")
+
+        logger.info(f"Message processed successfully from {message.chat.id}")
+
+    except Exception as e:
+        logger.error(f"Error processing message: {e}", exc_info=True)
+    finally:
+        is_processing = False
+
+async def queue_worker():
+    """کارگر پردازش صف"""
+    global is_processing
+
+    while True:
+        if not message_queue.empty():
+            is_processing = True
+            message = await message_queue.get()
+            await process_message(message)
+            message_queue.task_done()
+        else:
+            await asyncio.sleep(1)
+
+@bot.on_message(filters.command("start"))
+async def start_command(client, message):
+    """دستور /start"""
+    await message.reply_text(
+        "سلام! من ربات کپی محتوا هستم.\n"
+        "برای تنظیم کلمات جایگزین از دستور /replace استفاده کنید.\n"
+        "مثال: /replace قدیمی جدید"
+    )
+
+@bot.on_message(filters.command("replace"))
+async def replace_command(client, message):
+    """دستور /replace برای تنظیم کلمات جایگزین"""
+    user_id = str(message.from_user.id)
+
+    if user_id not in ADMIN_USER_IDS:
+        await message.reply_text("شما اجازه استفاده از این دستور را ندارید.")
+        return
+
+    args = message.text.split()[1:]
+    if len(args) < 2:
+        await message.reply_text(
+            "لطفا کلمه قدیمی و جدید را وارد کنید.\n"
+            "مثال: /replace قدیمی جدید"
+        )
+        return
+
+    old_word = args[0]
+    new_word = ' '.join(args[1:])
+
+    replacement_words[old_word] = new_word
+
+    await message.reply_text(
+        f"کلمه '{old_word}' با '{new_word}' جایگزین خواهد شد.\n"
+        f"تعداد کل کلمات جایگزین: {len(replacement_words)}"
+    )
+
+@bot.on_message(filters.command("replacements"))
+async def show_replacements_command(client, message):
+    """نمایش کلمات جایگزین"""
+    user_id = str(message.from_user.id)
+
+    if user_id not in ADMIN_USER_IDS:
+        await message.reply_text("شما اجازه استفاده از این دستور را ندارید.")
+        return
+
+    if not replacement_words:
+        await message.reply_text("هیچ کلمه جایگزینی تنظیم نشده است.")
+        return
+
+    text = "کلمات جایگزین:\n"
+    for old, new in replacement_words.items():
+        text += f"{old} → {new}\n"
+
+    await message.reply_text(text)
+
+@bot.on_message(filters.command("clear"))
+async def clear_replacements_command(client, message):
+    """پاک کردن همه کلمات جایگزین"""
+    user_id = str(message.from_user.id)
+
+    if user_id not in ADMIN_USER_IDS:
+        await message.reply_text("شما اجازه استفاده از این دستور را ندارید.")
+        return
+
+    replacement_words.clear()
+    await message.reply_text("همه کلمات جایگزین پاک شدند.")
+
+@bot.on_message(filters.command("status"))
+async def status_command(client, message):
+    """نمایش وضعیت ربات"""
+    user_id = str(message.from_user.id)
+
+    if user_id not in ADMIN_USER_IDS:
+        await message.reply_text("شما اجازه استفاده از این دستور را ندارید.")
+        return
+
+    status = f"""
+وضعیت ربات:
+- تعداد پیام‌ها در صف: {message_queue.qsize()}
+- در حال پردازش: {is_processing}
+- تعداد کلمات جایگزین: {len(replacement_words)}
+- کانال مبدا: {SOURCE_CHANNEL_ID}
+- کانال مقصد: {DEST_CHANNEL_ID}
+"""
+
+    await message.reply_text(status)
+
+async def monitor_channel():
+    """مانیتورینگ کانال مبدا با استفاده از User Client"""
+    logger.info(f"Starting to monitor channel: {SOURCE_CHANNEL_ID}")
+
+    last_message_id = 0
+
+    while True:
+        try:
+            # دریافت آخرین پیام‌های کانال
+            async for message in app.get_chat_history(SOURCE_CHANNEL_ID, limit=1):
+                if message and message.id > last_message_id:
+                    logger.info(f"New message detected: {message.id}")
+
+                    # اضافه کردن به صف
+                    await message_queue.put(message)
+                    last_message_id = message.id
+
+            await asyncio.sleep(2)  # بررسی هر 2 ثانیه
+
+        except Exception as e:
+            logger.error(f"Error monitoring channel: {e}", exc_info=True)
+            await asyncio.sleep(5)
+
+async def main():
+    """تابع اصلی"""
+    global app, bot
+
+    # بررسی متغیرهای محیطی
+    if not API_ID or not API_HASH:
+        logger.error("API_ID or API_HASH not found in environment variables")
+        return
+
+    if not BOT_TOKEN:
+        logger.error("BOT_TOKEN not found in environment variables")
+        return
+
+    if not SOURCE_CHANNEL_ID or not DEST_CHANNEL_ID:
+        logger.error("SOURCE_CHANNEL_ID or DEST_CHANNEL_ID not found")
+        return
+
+    logger.info(f"Source Channel: {SOURCE_CHANNEL_ID}")
+    logger.info(f"Dest Channel: {DEST_CHANNEL_ID}")
+
+    # ساخت کلاینت کاربر (User Client)
+    app = Client(
+        name="user_session",
+        api_id=int(API_ID),
+        api_hash=API_HASH,
+        session_string=os.getenv('SESSION_STRING', None)
+    )
+
+    # ساخت کلاینت ربات (Bot Client)
+    bot = Client(
+        name="bot_session",
+        api_token=BOT_TOKEN
+    )
+
+    # شروع کلاینت‌ها
+    await app.start()
+    await bot.start()
+
+    logger.info("User client and Bot client started successfully")
+
+    # شروع کارگر صف
+    asyncio.create_task(queue_worker())
+
+    # شروع مانیتورینگ کانال
+    asyncio.create_task(monitor_channel())
+
+    # نگه داشتن برنامه در حال اجرا
+    while True:
+        await asyncio.sleep(1)
+
+if __name__ == '__main__':
+    asyncio.run(main())
+
+
++++ bot.py (修改后)
+import os
+import asyncio
+import logging
 import sqlite3
-from datetime import datetime
+import re
+from typing import Optional, Dict
 from pyrogram import Client, filters, enums
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
-from pyrogram.errors import FloodWait, PeerIdInvalid, ChannelPrivate
-from aiohttp import ClientSession
+from pyrogram.types import Message
+from pyrogram.handlers import MessageHandler
+from pyrogram.errors import FloodWait, PeerIdInvalid, ChannelPrivate, UserNotParticipant
+from dotenv import load_dotenv
+import aiohttp
 from PIL import Image
 import io
 
-# --- تنظیمات لاگینگ ---
+# تنظیمات لاگینگ
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# --- دریافت متغیرهای محیطی ---
+load_dotenv()
+
+# خواندن متغیرهای محیطی
 API_ID = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SOURCE_CHANNEL_ID = os.getenv("SOURCE_CHANNEL_ID")
 DEST_CHANNEL_ID = os.getenv("DEST_CHANNEL_ID")
-ADMIN_USER_IDS = os.getenv("ADMIN_USER_IDS", "")
+ADMIN_USER_IDS = os.getenv("ADMIN_USER_IDS", "").split(",")
 DEFAULT_THUMBNAIL_URL = os.getenv("DEFAULT_THUMBNAIL_URL")
 SESSION_STRING = os.getenv("SESSION_STRING")
 
-# بررسی اجباری متغیرها
+# اعتبارسنجی متغیرهای ضروری
 if not all([API_ID, API_HASH, BOT_TOKEN, SOURCE_CHANNEL_ID, DEST_CHANNEL_ID]):
-    logger.error("❌ یکی از متغیرهای محیطی ضروری (API_ID, API_HASH, BOT_TOKEN, SOURCE/DEST_ID) تعریف نشده است.")
-    sys.exit(1)
+    logger.error("❌ متغیرهای محیطی ضروری تنظیم نشده‌اند!")
+    exit(1)
 
-# تبدیل آیدی‌ها به عدد
-try:
-    SOURCE_CHANNEL_ID = int(SOURCE_CHANNEL_ID)
-    DEST_CHANNEL_ID = int(DEST_CHANNEL_ID)
-    ADMIN_IDS_LIST = [int(x.strip()) for x in ADMIN_USER_IDS.split(",") if x.strip()]
-except ValueError:
-    logger.error("❌ فرمت آیدی کانال‌ها یا ادمین‌ها اشتباه است. باید عدد باشند (مثلا -100...)")
-    sys.exit(1)
+# تبدیل آیدی ادمین‌ها به عدد
+admin_ids = []
+for admin_id in ADMIN_USER_IDS:
+    try:
+        admin_ids.append(int(admin_id.strip()))
+    except ValueError:
+        pass
 
-# --- راه‌اندازی دیتابیس SQLite ---
+# اتصال به دیتابیس
 def init_db():
     conn = sqlite3.connect('bot_data.db')
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS replacements (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    source_word TEXT UNIQUE,
-                    target_word TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS settings (
-                    key TEXT PRIMARY KEY,
-                    value TEXT)''')
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS replacements (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_word TEXT UNIQUE,
+            target_word TEXT
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            message_id INTEGER,
+            status TEXT DEFAULT 'pending'
+        )
+    ''')
     conn.commit()
     conn.close()
 
 init_db()
 
-# --- توابع کمکی دیتابیس ---
-def get_replacements():
+# ایجاد کلاینت‌ها
+bot_client = None
+user_client = None
+
+if SESSION_STRING:
+    user_client = Client(
+        "user_session",
+        api_id=int(API_ID),
+        api_hash=API_HASH,
+        session_string=SESSION_STRING
+    )
+    logger.info("✅ یوزر کلاینت با SESSION_STRING راه‌اندازی شد.")
+else:
+    logger.warning("⚠️ SESSION_STRING یافت نشد. ربات فقط با توکن ربات اجرا می‌شود.")
+    logger.warning("⚠️ برای خواندن کانال‌های خصوصی بدون ادمین، حتماً SESSION_STRING لازم است.")
+
+bot_client = Client(
+    "bot_session",
+    api_id=int(API_ID),
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN
+)
+
+# صف پیام‌ها
+message_queue = asyncio.Queue()
+is_processing = False
+
+# توابع کمکی
+def get_replacements() -> Dict[str, str]:
     conn = sqlite3.connect('bot_data.db')
-    c = conn.cursor()
-    c.execute("SELECT source_word, target_word FROM replacements")
-    data = {row[0]: row[1] for row in c.fetchall()}
+    cursor = conn.cursor()
+    cursor.execute('SELECT source_word, target_word FROM replacements')
+    replacements = {row[0]: row[1] for row in cursor.fetchall()}
     conn.close()
-    return data
+    return replacements
 
-def add_replacement(source, target):
+def add_replacement(source: str, target: str):
+    conn = sqlite3.connect('bot_data.db')
+    cursor = conn.cursor()
     try:
-        conn = sqlite3.connect('bot_data.db')
-        c = conn.cursor()
-        c.execute("INSERT OR REPLACE INTO replacements (source_word, target_word) VALUES (?, ?)", (source, target))
+        cursor.execute('INSERT OR REPLACE INTO replacements (source_word, target_word) VALUES (?, ?)', (source, target))
         conn.commit()
+    finally:
         conn.close()
-        return True
-    except Exception as e:
-        logger.error(f"خطا در ذخیره جایگزینی: {e}")
-        return False
 
-def remove_replacement(source):
+def remove_replacement(source: str):
+    conn = sqlite3.connect('bot_data.db')
+    cursor = conn.cursor()
     try:
-        conn = sqlite3.connect('bot_data.db')
-        c = conn.cursor()
-        c.execute("DELETE FROM replacements WHERE source_word = ?", (source,))
+        cursor.execute('DELETE FROM replacements WHERE source_word = ?', (source,))
         conn.commit()
-        count = c.rowcount
+    finally:
         conn.close()
-        return count > 0
-    except Exception as e:
-        logger.error(f"خطا در حذف جایگزینی: {e}")
-        return False
 
-# --- توابع پردازش متن و مدیا ---
-def clean_text(text: str) -> str:
+def remove_premium_emojis(text: str) -> str:
     if not text:
         return ""
-    
-    # حذف ایموجی‌های پرمیوم (کاراکترهای خاص یونیکد مرتبط با ایموجی‌های متحرک تلگرام)
-    # این الگو طیف وسیعی از ایموجی‌ها را پوشش می‌دهد تا مطمئن شویم پرمیوم‌ها حذف می‌شوند
-    # ایموجی‌های پرمیوم معمولاً در بازه‌های خاصی هستند یا ترکیبی‌اند. 
-    # ساده‌ترین راه حذف همه ایموجی‌هاست اگر بخواهیم فقط متن بماند، اما اینجا سعی می‌کنیم هوشمند عمل کنیم.
-    # برای اطمینان کامل از حذف پرمیوم، ما کل ایموجی‌ها را با نسخه متنی یا خالی جایگزین نمی‌کنیم مگر اینکه کاربر بخواهد.
-    # اما درخواست شما "استفاده از ایموجی عادی" بود. تلگرام ایموجی پرمیوم را به صورت انیمیشن نشان می‌دهد.
-    # وقتی پیام کپی می‌شود، اگر فونت سیستم مقصد پشتیبانی نکند، خودبه‌خود استاتیک می‌شود.
-    # با این حال، برای تمیزکاری، کاراکترهای ترکیبی خاص را حذف می‌کنیم.
-    
-    # حذف کاراکترهای Zero Width Joiner که اغلب برای ایموجی‌های پیچیده استفاده می‌شوند
-    text = text.replace('\u200d', '') 
-    
-    # جایگزینی کلمات بر اساس دیتابیس
-    replacements = get_replacements()
-    for src, tgt in replacements.items():
-        text = text.replace(src, tgt)
-        
-    return text
+    # حذف ایموجی‌ها (برای جلوگیری از نمایش پرمیوم)
+    emoji_pattern = re.compile("["
+        u"\U0001F600-\U0001F64F"  # emoticons
+        u"\U0001F300-\U0001F5FF"  # symbols & pictographs
+        u"\U0001F680-\U0001F6FF"  # transport & map symbols
+        u"\U0001F700-\U0001F77F"  # alchemical symbols
+        u"\U0001F780-\U0001F7FF"  # Geometric Shapes Extended
+        u"\U0001F800-\U0001F8FF"  # Supplemental Arrows-C
+        u"\U0001F900-\U0001F9FF"  # Supplemental Symbols and Pictographs
+        u"\U0001FA00-\U0001FA6F"  # Chess Symbols
+        u"\U0001FA70-\U0001FAFF"  # Symbols and Pictographs Extended-A
+        u"\U00002702-\U000027B0"  # Dingbats
+        u"\U000024C2-\U0001F251"
+        "]+", flags=re.UNICODE)
+    return emoji_pattern.sub(r'', text)
 
-async def download_thumbnail(url: str) -> str:
-    """دانلود تامنیل از URL و برگرداندن مسیر فایل محلی"""
-    if not url:
-        return None
-    
-    filename = f"thumb_{datetime.now().timestamp()}.jpg"
+async def download_thumbnail(url: str) -> Optional[str]:
     try:
-        async with ClientSession() as session:
-            async with session.get(url) as resp:
-                if resp.status == 200:
-                    content = await resp.read()
-                    # تبدیل به JPG با Pillow برای اطمینان از فرمت صحیح
-                    img = Image.open(io.BytesIO(content))
-                    if img.mode in ("RGBA", "P"):
-                        img = img.convert("RGB")
-                    # تغییر سایز به استاندارد تلگرام (اختیاری ولی توصیه شده)
-                    img.thumbnail((320, 320)) 
-                    img.save(filename, "JPEG")
-                    return filename
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as response:
+                if response.status == 200:
+                    image_data = await response.read()
+                    img = Image.open(io.BytesIO(image_data))
+                    img_path = "temp_thumb.jpg"
+                    img.save(img_path, "JPEG")
+                    return img_path
     except Exception as e:
         logger.error(f"خطا در دانلود تامنیل: {e}")
     return None
 
-# --- ایجاد کلاینت‌ها ---
-# کلاینت ربات
-bot_app = Client(
-    "bot_session",
-    api_id=int(API_ID),
-    api_hash=API_HASH,
-    bot_token=BOT_TOKEN,
-    workers=50,
-    sleep_threshold=60
-)
-
-# کلاینت یوزر (برای خواندن کانال مبدا بدون ادمین بودن)
-user_app = None
-if SESSION_STRING:
-    user_app = Client(
-        "user_session",
-        api_id=int(API_ID),
-        api_hash=API_HASH,
-        session_string=SESSION_STRING,
-        workers=50,
-        sleep_threshold=60
-    )
-    logger.info("✅ کلاینت یوزر با Session String فعال شد.")
-else:
-    logger.warning("⚠️ SESSION_STRING یافت نشد. ربات فقط با توکن ربات اجرا می‌شود. برای خواندن کانال‌های خصوصی بدون ادمین، حتماً SESSION_STRING لازم است.")
-
-# --- صف پردازش ---
-message_queue = asyncio.Queue()
-
-async def process_message_task(message: Message):
-    """تابع اصلی پردازش و کپی پیام"""
+async def process_message(msg: Message):
+    global is_processing
     try:
-        if not message:
-            return
+        replacements = get_replacements()
+        caption = msg.caption or ""
 
-        # 1. آماده‌سازی کپشن
-        original_caption = message.caption if message.caption else ""
-        new_caption = clean_text(original_caption)
-        
-        # 2. آماده‌سازی تامنیل
+        # جایگزینی کلمات در کپشن
+        for source, target in replacements.items():
+            caption = caption.replace(source, target)
+
+        # حذف ایموجی‌های پرمیوم
+        caption = remove_premium_emojis(caption)
+
+        # تعیین تامنیل جدید
         thumb_path = None
         if DEFAULT_THUMBNAIL_URL:
             thumb_path = await download_thumbnail(DEFAULT_THUMBNAIL_URL)
-        
-        # اگر ویدیو تامنیل خودش را دارد و ما می‌خواهیم عوض کنیم،.thumb_path را پاس می‌دهیم
-        # اگر تامنیل خاصی نداریم، None می‌فرستیم تا تلگرام خودش جنریت کند
-        
-        media_type = message.media
-        file_id = None
-        
-        # استخراج فایل مدیا
-        if media_type == enums.MessageMediaType.PHOTO:
-            file_id = message.photo.file_id
-        elif media_type == enums.MessageMediaType.VIDEO:
-            file_id = message.video.file_id
-        elif media_type == enums.MessageMediaType.DOCUMENT:
-            file_id = message.document.file_id
-        elif media_type == enums.MessageMediaType.AUDIO:
-            file_id = message.audio.file_id
-        elif media_type == enums.MessageMediaType.VOICE:
-            file_id = message.voice.file_id
-        elif media_type == enums.MessageMediaType.ANIMATION:
-            file_id = message.animation.file_id
-        elif media_type == enums.MessageMediaType.VIDEO_NOTE:
-            file_id = message.video_note.file_id
 
-        if not file_id:
-            # پیام متنی خالی یا غیرقابل کپی
-            if new_caption:
-                await bot_app.send_message(chat_id=DEST_CHANNEL_ID, text=new_caption)
-            return
-
-        # ارسال به کانال مقصد
-        # نکته: برای کپی کردن بدون نام فوروارد، از روش send_... با file_id استفاده می‌کنیم
-        # این روش محتوا را دوباره آپلود نمی‌کند، فقط ارجاع می‌دهد (سریع و بدون نام فوروارد)
-        
-        send_method = getattr(bot_app, f"send_{media_type.value}", None)
-        
-        if send_method:
-            kwargs = {
-                "chat_id": DEST_CHANNEL_ID,
-                "file_id": file_id,
-                "caption": new_caption if new_caption else None,
-            }
-            
-            # اضافه کردن تامنیل فقط برای ویدیوها و داکیومنت‌ها
-            if media_type in [enums.MessageMediaType.VIDEO, enums.MessageMediaType.DOCUMENT, enums.MessageMediaType.ANIMATION]:
-                if thumb_path:
-                    kwargs["thumbnail"] = thumb_path
-            
-            # ارسال پیام
-            await send_method(**kwargs)
-            logger.info(f"✅ پیام کپی شد: {message.id} -> {DEST_CHANNEL_ID}")
+        # کپی پیام به کانال مقصد
+        if msg.photo:
+            file_id = msg.photo.file_id
+            await bot_client.send_photo(
+                chat_id=DEST_CHANNEL_ID,
+                photo=file_id,
+                caption=caption,
+                parse_mode=enums.ParseMode.MARKDOWN,
+                thumb=thumb_path
+            )
+        elif msg.video:
+            file_id = msg.video.file_id
+            await bot_client.send_video(
+                chat_id=DEST_CHANNEL_ID,
+                video=file_id,
+                caption=caption,
+                parse_mode=enums.ParseMode.MARKDOWN,
+                thumb=thumb_path
+            )
+        elif msg.document:
+            file_id = msg.document.file_id
+            await bot_client.send_document(
+                chat_id=DEST_CHANNEL_ID,
+                document=file_id,
+                caption=caption,
+                parse_mode=enums.ParseMode.MARKDOWN,
+                thumb=thumb_path
+            )
+        elif msg.audio:
+            file_id = msg.audio.file_id
+            await bot_client.send_audio(
+                chat_id=DEST_CHANNEL_ID,
+                audio=file_id,
+                caption=caption,
+                parse_mode=enums.ParseMode.MARKDOWN,
+                thumb=thumb_path
+            )
+        elif msg.voice:
+            file_id = msg.voice.file_id
+            await bot_client.send_voice(
+                chat_id=DEST_CHANNEL_ID,
+                voice=file_id,
+                caption=caption,
+                parse_mode=enums.ParseMode.MARKDOWN
+            )
+        elif msg.text:
+            await bot_client.send_message(
+                chat_id=DEST_CHANNEL_ID,
+                text=caption,
+                parse_mode=enums.ParseMode.MARKDOWN
+            )
         else:
-            logger.warning(f"نوع مدیا پشتیبانی نشد: {media_type}")
+            # کپی عمومی برای سایر انواع پیام
+            await msg.copy(
+                chat_id=DEST_CHANNEL_ID,
+                caption=caption,
+                parse_mode=enums.ParseMode.MARKDOWN
+            )
 
-    except FloodWait as e:
-        logger.warning(f"⏳ فلود ویت: {e.value} ثانیه صبر کنید.")
-        await asyncio.sleep(e.value)
-        # تلاش مجدد (می‌توانید منطق پیچیده‌تری برای ریترای اضافه کنید)
-        await process_message_task(message)
+        logger.info(f"پیام {msg.id} با موفقیت کپی شد.")
+
     except Exception as e:
-        logger.error(f"❌ خطا در پردازش پیام {message.id}: {e}")
+        logger.error(f"خطا در پردازش پیام {msg.id}: {e}")
     finally:
-        # حذف فایل تامنیل موقت
+        is_processing = False
         if thumb_path and os.path.exists(thumb_path):
-            try:
-                os.remove(thumb_path)
-            except:
-                pass
+            os.remove(thumb_path)
 
 async def queue_worker():
-    """کارگر صف که پیام‌ها را یکی‌یکی پردازش می‌کند"""
+    global is_processing
     while True:
-        task = await message_queue.get()
-        await process_message_task(task)
-        message_queue.task_done()
+        if not message_queue.empty() and not is_processing:
+            is_processing = True
+            msg = await message_queue.get()
+            await process_message(msg)
+            message_queue.task_done()
+        await asyncio.sleep(1)
 
-# --- هندلرهای پیام (تعریف توابع) ---
-
-async def handle_start(client, message: Message):
-    if message.from_user.id not in ADMIN_IDS_LIST:
+# هندلرهای ربات
+async def start_handler(client: Client, message: Message):
+    if message.from_user.id not in admin_ids:
         return
-    await message.reply(
-        "👋 سلام! من ربات کپی‌کننده پیشرفته هستم.\n\n"
-        "📝 **دستورات:**\n"
-        "/replace <کلمه مبدا> <کلمه مقصد> - افزودن قانون جایگزینی\n"
-        "/delreplace <کلمه مبدا> - حذف قانون جایگزینی\n"
-        "/listreplace - لیست قوانین فعلی\n"
-        "/status - وضعیت صف و آمار\n"
-        "\n🔄 اکنون در حال گوش دادن به کانال مبدا..."
+    await message.reply_text(
+        "👋 سلام! ربات آماده است.\n"
+        "دستورات موجود:\n"
+        "/replace <کلمه مبدا> <کلمه مقصد> - افزودن جایگزینی\n"
+        "/remove <کلمه> - حذف جایگزینی\n"
+        "/list - لیست جایگزینی‌ها\n"
+        "/status - وضعیت صف"
     )
 
-async def handle_replace(client, message: Message):
-    if message.from_user.id not in ADMIN_IDS_LIST:
+async def replace_handler(client: Client, message: Message):
+    if message.from_user.id not in admin_ids:
         return
-    
     args = message.text.split(maxsplit=2)
     if len(args) < 3:
-        await message.reply("❌ فرمت اشتباه.\nمثال: `/replace سلام درود`")
+        await message.reply_text("❌ فرمت صحیح: /replace <کلمه مبدا> <کلمه مقصد>")
         return
-    
     source = args[1]
     target = args[2]
-    
-    if add_replacement(source, target):
-        await message.reply(f"✅ قانون اضافه شد:\n«{source}» ➡️ «{target}»")
-    else:
-        await message.reply("❌ خطا در ذخیره قانون.")
+    add_replacement(source, target)
+    await message.reply_text(f"✅ جایگزینی '{source}' به '{target}' افزوده شد.")
 
-async def handle_delreplace(client, message: Message):
-    if message.from_user.id not in ADMIN_IDS_LIST:
+async def remove_handler(client: Client, message: Message):
+    if message.from_user.id not in admin_ids:
         return
-    
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
-        await message.reply("❌ فرمت اشتباه.\nمثال: `/delreplace سلام`")
+        await message.reply_text("❌ فرمت صحیح: /remove <کلمه>")
         return
-    
     source = args[1]
-    if remove_replacement(source):
-        await message.reply(f"✅ قانون برای «{source}» حذف شد.")
-    else:
-        await message.reply("❌ چنین قانونی وجود نداشت.")
+    remove_replacement(source)
+    await message.reply_text(f"✅ جایگزینی '{source}' حذف شد.")
 
-async def handle_listreplace(client, message: Message):
-    if message.from_user.id not in ADMIN_IDS_LIST:
+async def list_handler(client: Client, message: Message):
+    if message.from_user.id not in admin_ids:
         return
-    
-    reps = get_replacements()
-    if not reps:
-        await message.reply("📭 هیچ قانون جایگزینی وجود ندارد.")
+    replacements = get_replacements()
+    if not replacements:
+        await message.reply_text("📭 هیچ جایگزینی ثبت نشده است.")
         return
-    
-    text = "📋 **لیست قوانین:**\n"
-    for s, t in reps.items():
-        text += f"▫️ `{s}` ➡️ `{t}`\n"
-    
-    await message.reply(text)
+    text = "📋 لیست جایگزینی‌ها:\n"
+    for src, tgt in replacements.items():
+        text += f"- {src} ➜ {tgt}\n"
+    await message.reply_text(text)
 
-async def handle_status(client, message: Message):
-    if message.from_user.id not in ADMIN_IDS_LIST:
+async def status_handler(client: Client, message: Message):
+    if message.from_user.id not in admin_ids:
         return
-    
-    q_size = message_queue.qsize()
-    await message.reply(f"📊 **وضعیت سیستم:**\n"
-                        f"• پیام‌های در صف: `{q_size}`\n"
-                        f"• کانال مبدا: `{SOURCE_CHANNEL_ID}`\n"
-                        f"• کانال مقصد: `{DEST_CHANNEL_ID}`")
+    queue_size = message_queue.qsize()
+    await message.reply_text(f"📊 وضعیت صف: {queue_size} پیام در انتظار")
 
-async def forward_handler(client, message: Message):
-    """هندلر اصلی برای دریافت پیام‌های فوروارد شده از کانال مبدا به ربات"""
-    # این تابع زمانی اجرا می‌شود که کاربر (یا ربات در حالت یوزر) پیامی را فوروارد کند
-    # اما هدف ما شنیدن خودکار کانال است.
-    pass
+async def forward_handler(client: Client, message: Message):
+    # بررسی اینکه آیا پیام از کانال مبدا است
+    if str(message.chat.id) == SOURCE_CHANNEL_ID:
+        await message_queue.put(message)
+        logger.info(f"پیام {message.id} از کانال مبدا به صف اضافه شد.")
 
-async def monitor_channel_task():
-    """تسک نظارت بر کانال مبدا (فقط اگر یوزر بات فعال باشد)"""
-    if not user_app:
-        logger.warning("⚠️ نظارت خودکار غیرفعال است (SESSION_STRING نداریم). لطفاً پیام‌ها را دستی به ربات فوروارد کنید یا Session String اضافه کنید.")
-        return
-
-    try:
-        await user_app.start()
-        logger.info(f"👀 شروع نظارت بر کانال {SOURCE_CHANNEL_ID} ...")
-        
-        last_msg_id = 0
-        # دریافت آخرین پیام برای اینکه از کجا شروع کنیم (اختیاری، برای جلوگیری از پردازش تاریخچه قدیمی)
-        # اینجا فرض می‌کنیم می‌خواهیم پیام‌های جدید را لحظه‌ای بگیریم.
-        # روش بهتر: استفاده از iter_messages با reverse=True و پر کردن صف
-        
-        async for message in user_app.get_chat_history(SOURCE_CHANNEL_ID, limit=1):
-            last_msg_id = message.id
-            logger.info(f"آخرین پیام موجود در کانال: {last_msg_id}")
-        
-        # حلقه بی‌پایان برای چک کردن پیام‌های جدید
-        while True:
-            try:
-                # دریافت پیام‌های جدیدتر از last_msg_id
-                # توجه: get_chat_history از جدید به قدیم می‌دهد.
-                # ما یک پیام می‌گیریم، اگر جدیدتر بود پردازش می‌کنیم.
-                async for message in user_app.get_chat_history(SOURCE_CHANNEL_ID, offset_id=last_msg_id, reverse=True, limit=10):
-                    if message.id > last_msg_id:
-                        logger.info(f"📩 پیام جدید detected: {message.id}")
-                        await message_queue.put(message)
-                        last_msg_id = message.id
-                    else:
-                        break # پیام‌ها قدیمی‌تر شدند
-                
-                await asyncio.sleep(5) # چک کردن هر 5 ثانیه
-                
-            except FloodWait as e:
-                logger.warning(f"⏳ فلود ویت در مانیتورینگ: {e.value}")
-                await asyncio.sleep(e.value)
-            except Exception as e:
-                logger.error(f"خطا در مانیتورینگ کانال: {e}")
-                await asyncio.sleep(10)
-                
-    except Exception as e:
-        logger.error(f"❌ خطا در شروع یوزر بات: {e}")
-    finally:
-        if user_app.is_connected:
-            await user_app.stop()
-
-# --- تابع اصلی اجرا ---
 async def main():
-    # شروع ربات
-    await bot_app.start()
+    # شروع ربات بات
+    await bot_client.start()
     logger.info("🤖 ربات بات شروع شد.")
-    
-    # ثبت هندلرها به صورت دستی (جلوگیری از خطای NameError)
-    bot_app.add_handler(handlers=MessageHandler(handle_start, filters.command("start")))
-    bot_app.add_handler(handlers=MessageHandler(handle_replace, filters.command("replace")))
-    bot_app.add_handler(handlers=MessageHandler(handle_delreplace, filters.command("delreplace")))
-    bot_app.add_handler(handlers=MessageHandler(handle_listreplace, filters.command("listreplace")))
-    bot_app.add_handler(handlers=MessageHandler(handle_status, filters.command("status")))
-    
-    # هندلر برای پیام‌های فوروارد شده دستی به ربات (اگر یوزر بات ندارید)
-    async def manual_forward_handler(client, message: Message):
-        if message.forward_from_chat and message.forward_from_chat.id == SOURCE_CHANNEL_ID:
-            logger.info(f"📨 دریافت فوروارد دستی: {message.id}")
-            await message_queue.put(message)
-            await message.reply("✅ دریافت شد و در صف قرار گرفت.")
-        elif message.chat.id == SOURCE_CHANNEL_ID: 
-            # اگر یوزر بات کار نکرد و somehow پیام مستقیم آمد (کم اتفاق می‌افتد مگر با یوزر بات)
-            await message_queue.put(message)
-            
-    bot_app.add_handler(handlers=MessageHandler(manual_forward_handler, filters=filters.forwarded))
 
-    # شروع کارگر صف
+    # ثبت هندلرها برای ربات بات
+    bot_client.add_handler(MessageHandler(start_handler, filters.command("start")))
+    bot_client.add_handler(MessageHandler(replace_handler, filters.command("replace")))
+    bot_client.add_handler(MessageHandler(remove_handler, filters.command("remove")))
+    bot_client.add_handler(MessageHandler(list_handler, filters.command("list")))
+    bot_client.add_handler(MessageHandler(status_handler, filters.command("status")))
+    bot_client.add_handler(MessageHandler(forward_handler, filters.chat(int(SOURCE_CHANNEL_ID))))
+
+    # شروع یوزر بات اگر SESSION_STRING وجود دارد
+    if user_client:
+        await user_client.start()
+        logger.info("👤 یوزر بات شروع شد.")
+        # ثبت هندلر برای یوزر بات (برای دریافت پیام از کانال مبدا)
+        user_client.add_handler(MessageHandler(forward_handler, filters.chat(int(SOURCE_CHANNEL_ID))))
+
+    # شروع ورکر صف
     asyncio.create_task(queue_worker())
-    
-    # شروع نظارت بر کانال (اگر یوزر بات باشد)
-    if user_app:
-        asyncio.create_task(monitor_channel_task())
-    else:
-        logger.info("💡 راهنما: برای کپی خودکار بدون فوروارد دستی، حتماً SESSION_STRING را در Railway تنظیم کنید.")
 
-    logger.info("✨ ربات آماده به کار است!")
-    
-    # نگه داشتن برنامه
+    logger.info("✅ ربات آماده به کار است. تا زمانی که متوقف نشده، اجرا می‌شود...")
+    # نگه داشتن برنامه در حال اجرا
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
@@ -429,4 +770,4 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logger.info("🛑 ربات متوقف شد.")
     except Exception as e:
-        logger.critical(f"💥 خطای بحرانی: {e}")
+        logger.critical(f"💥 خطای بحرانی: {e}", exc_info=True)
